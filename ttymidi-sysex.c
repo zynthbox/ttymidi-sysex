@@ -67,6 +67,11 @@
 	All prints to stdout flushed immediately
 	Remaining issue : the non-midi text command FF 00 00 most of the times does not display the whole text message, seems to interfere with something
 
+	**************************
+	Modified 2026 by leinir
+	**************************
+	Added in a flag to allow marking the client as hardware, useful for when devices which are reasonably viewed as hardware (such as DIN ports) are used for the purpose
+
 	See tags *new* on changes wrt original ttymidi code and/or JW's or EB's code (I did not use sixeight7's code at all)
 	To compile: gcc ttymidi-sysex.c -o ttymidi-sysex -lasound -lpthread
 */
@@ -109,6 +114,7 @@ static struct argp_option options[] =
 {
 	{"serialdevice" , 's', "DEV" , 0, "Serial device to use. Default = /dev/ttyUSB0" },
 	{"baudrate"     , 'b', "BAUD", 0, "Serial port baud rate. Default = 115200" },
+	{"hardwaredevice", 'd', 0    , 0, "Register the Alsa MIDI ports as hardware (default is software)" },
 	{"verbose"      , 'v', 0     , 0, "For debugging: Produce verbose output" },
 	{"printonly"    , 'p', 0     , 0, "Super debugging: Print values read from serial -- and do nothing else" },
 	{"quiet"        , 'q', 0     , 0, "Don't produce any output, even when the print command is sent" },
@@ -118,7 +124,7 @@ static struct argp_option options[] =
 
 typedef struct _arguments
 {
-	int  silent, verbose, printonly;
+	int  silent, verbose, printonly, hardwaredevice;
 	char serialdevice[MAX_DEV_STR_LEN];
 	int  baudrate;
 	char name[MAX_DEV_STR_LEN];
@@ -156,6 +162,9 @@ static error_t parse_opt (int key, char *arg, struct argp_state *state)
 			if (arg == NULL) break;
 			strncpy(arguments->name, arg, MAX_DEV_STR_LEN);
 			break;
+		case 'd':
+			arguments->hardwaredevice = TRUE;
+			break;
 		case 'b':
 			if (arg == NULL) break;
 			baud_temp = strtol(arg, NULL, 0);
@@ -190,6 +199,7 @@ void arg_set_defaults(arguments_t *arguments)
 	arguments->printonly    = 0;
 	arguments->silent       = 0;
 	arguments->verbose      = 0;
+	arguments->hardwaredevice = FALSE;
 	arguments->baudrate     = B115200;
 	char *name_tmp		= (char *)"ttymidi";
 	strncpy(arguments->serialdevice, serialdevice_temp, MAX_DEV_STR_LEN);
@@ -218,16 +228,20 @@ int open_seq(snd_seq_t** seq)
 
 	snd_seq_set_client_name(*seq, arguments.name);
 
+	int deviceType = SND_SEQ_PORT_TYPE_APPLICATION;
+	if (arguments.hardwaredevice == TRUE) {
+		deviceType = SND_SEQ_PORT_TYPE_HARDWARE;
+	}
 	if ((port_out_id = snd_seq_create_simple_port(*seq, "MIDI out",
 					SND_SEQ_PORT_CAP_READ|SND_SEQ_PORT_CAP_SUBS_READ,
-					SND_SEQ_PORT_TYPE_MIDI_GENERIC|SND_SEQ_PORT_TYPE_APPLICATION)) < 0)  // *new*
+					SND_SEQ_PORT_TYPE_MIDI_GENERIC|deviceType)) < 0)  // *new*
 	{
 		fprintf(stderr, "Error creating sequencer MIDI out port.\n");  // *new*
 	}
 
 	if ((port_in_id = snd_seq_create_simple_port(*seq, "MIDI in",
 					SND_SEQ_PORT_CAP_WRITE|SND_SEQ_PORT_CAP_SUBS_WRITE,
-					SND_SEQ_PORT_TYPE_MIDI_GENERIC|SND_SEQ_PORT_TYPE_APPLICATION)) < 0)  // *new*
+					SND_SEQ_PORT_TYPE_MIDI_GENERIC|deviceType)) < 0)  // *new*
 	{
 		fprintf(stderr, "Error creating sequencer MIDI in port.\n");  // *new*
 	}
