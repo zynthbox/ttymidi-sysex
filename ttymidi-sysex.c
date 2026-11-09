@@ -252,6 +252,40 @@ int open_seq(snd_seq_t** seq)
 	return port_out_id;
 }
 
+/* Send a one-byte system message (real time F8-FE, or tune request F6) straight on. A real
+   time byte may arrive in the middle of any other message, a sysex included, and must
+   neither wait for it nor disturb its parsing, so the serial reader calls this as soon as it
+   sees one. F9 (tick) and the undefined FD have no event and are left out. */
+void send_system_byte(snd_seq_t* seq, int port_out_id, unsigned char status)
+{
+	int type = SND_SEQ_EVENT_NONE;
+	switch (status)
+	{
+		case 0xF6: type = SND_SEQ_EVENT_TUNE_REQUEST; break;
+		case 0xF8: type = SND_SEQ_EVENT_CLOCK; break;
+		case 0xFA: type = SND_SEQ_EVENT_START; break;
+		case 0xFB: type = SND_SEQ_EVENT_CONTINUE; break;
+		case 0xFC: type = SND_SEQ_EVENT_STOP; break;
+		case 0xFE: type = SND_SEQ_EVENT_SENSING; break;
+		default: break;
+	}
+	if (type != SND_SEQ_EVENT_NONE) {
+		snd_seq_event_t ev;
+		snd_seq_ev_clear(&ev);
+		snd_seq_ev_set_direct(&ev);
+		snd_seq_ev_set_source(&ev, port_out_id);
+		snd_seq_ev_set_subs(&ev);
+		snd_seq_ev_set_fixed(&ev);
+		ev.type = type;
+		if (!arguments.silent && arguments.verbose) {
+			printf("Serial  %02X System message\n", status);
+			fflush(stdout);
+		}
+		snd_seq_event_output_direct(seq, &ev);
+		snd_seq_drain_output(seq);
+	}
+}
+
 void parse_midi_command(snd_seq_t* seq, int port_out_id, unsigned char *buf, int buflen)  // *new*
 {
 /*
@@ -289,6 +323,7 @@ void parse_midi_command(snd_seq_t* seq, int port_out_id, unsigned char *buf, int
 
 	unsigned char operation, channel, param1, param2;  // *new* was int in original code
 	int int_param1;  // *new*
+	int send_event = TRUE;  // a status byte with no event of its own is only reported
 
 	operation = buf[0] & 0xF0;
 	channel   = buf[0] & 0x0F;
@@ -367,6 +402,37 @@ void parse_midi_command(snd_seq_t* seq, int port_out_id, unsigned char *buf, int
 				}
 				// Send sysex message
 				snd_seq_ev_set_sysex(&ev, buflen, buf);
+			} else if (buf[0] == 0xF1) {
+				if (!arguments.silent && arguments.verbose) {
+					printf("Serial  %02X Quarter frame      %02X\n", buf[0], param1);
+					fflush(stdout);
+				}
+				snd_seq_ev_set_fixed(&ev);
+				ev.type = SND_SEQ_EVENT_QFRAME;
+				ev.data.control.value = param1 & 0x7F;
+			} else if (buf[0] == 0xF2) {
+				int_param1 = (int) (param1 & 0x7F) + ((param2 & 0x7F) << 7);  // 14 bits, lsb first
+				if (!arguments.silent && arguments.verbose) {
+					printf("Serial  %02X Song position      %04X\n", buf[0], int_param1);
+					fflush(stdout);
+				}
+				snd_seq_ev_set_fixed(&ev);
+				ev.type = SND_SEQ_EVENT_SONGPOS;
+				ev.data.control.value = int_param1;
+			} else if (buf[0] == 0xF3) {
+				if (!arguments.silent && arguments.verbose) {
+					printf("Serial  %02X Song select        %02X\n", buf[0], param1);
+					fflush(stdout);
+				}
+				snd_seq_ev_set_fixed(&ev);
+				ev.type = SND_SEQ_EVENT_SONGSEL;
+				ev.data.control.value = param1 & 0x7F;
+			} else {
+				if (!arguments.silent) {
+					printf("Serial  %02X Unknown system cmd %02X %02X\n", buf[0], param1, param2);
+					fflush(stdout);
+				}
+				send_event = FALSE;
 			}
 			break;
 
@@ -375,11 +441,14 @@ void parse_midi_command(snd_seq_t* seq, int port_out_id, unsigned char *buf, int
 				printf("Serial  %02X Unknown MIDI cmd   %02X %02X %02X\n", operation, channel, param1, param2);  // *new*
 				fflush(stdout);  // *new*
 			}
+			send_event = FALSE;
 			break;
 	}
 
-	snd_seq_event_output_direct(seq, &ev);
-	snd_seq_drain_output(seq);
+	if (send_event == TRUE) {
+		snd_seq_event_output_direct(seq, &ev);
+		snd_seq_drain_output(seq);
+	}
 }
 
 void write_midi_action_to_serial_port(snd_seq_t* seq_handle)
@@ -617,6 +686,14 @@ void* read_midi_from_serial_port(void* seq)
 			read(serial, buf+i, 1);
 			buf[i] = buf[i] & 0xFF;  // *new* &0xFF (protection ?)
 
+			/* A real time byte (F8-FE) is forwarded at once and leaves the message being read
+			   untouched; FF stays with the text comment protocol below. A tune request (F6) is
+			   complete on its own as well. */
+			if ((buf[i] >= 0xF8 && buf[i] <= 0xFE) || buf[i] == 0xF6) {
+				send_system_byte(seq, port_out_id, buf[i]);
+				continue;
+			}
+
 			if (buf[i] >> 7 != 0) {
 				/* Status byte received and will always be first bit!*/
 				if(buf[i] == 0xF7 && buf[0] == 0xF0)	//if end of SysEx message has been reached *new*
@@ -642,7 +719,8 @@ void* read_midi_from_serial_port(void* seq)
 						i = 3;
 					} else {
 						/* Lets figure out are we done or should we read one more byte. */
-						if ((buf[0] & 0xF0) == 0xC0 || (buf[0] & 0xF0) == 0xD0) {
+						/* The two-byte system common messages (F1, F3) end here too */
+						if ((buf[0] & 0xF0) == 0xC0 || (buf[0] & 0xF0) == 0xD0 || buf[0] == 0xF1 || buf[0] == 0xF3) {
 							i = 3;
 						} else {
 							i = 2;
