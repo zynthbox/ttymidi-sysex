@@ -252,6 +252,21 @@ int open_seq(snd_seq_t** seq)
 	return port_out_id;
 }
 
+/* A SysEx longer than the serial buffer is sent on in parts as it arrives. The
+   parts after the first carry on the same message, so they go out without an F0 of their
+   own (otherwise every part would read as the start of a new message). */
+void send_sysex_continuation(snd_seq_t* seq, int port_out_id, unsigned char *data, int length)
+{
+	snd_seq_event_t ev;
+	snd_seq_ev_clear(&ev);
+	snd_seq_ev_set_direct(&ev);
+	snd_seq_ev_set_source(&ev, port_out_id);
+	snd_seq_ev_set_subs(&ev);
+	snd_seq_ev_set_sysex(&ev, length, data);
+	snd_seq_event_output_direct(seq, &ev);
+	snd_seq_drain_output(seq);
+}
+
 void parse_midi_command(snd_seq_t* seq, int port_out_id, unsigned char *buf, int buflen)  // *new*
 {
 /*
@@ -580,6 +595,7 @@ void* read_midi_from_serial_port(void* seq)
 {
 	unsigned char buf[BUF_SIZE], msg[MAX_MSG_SIZE];  // *new*
 	int i, msglen, bytesleft;  // *new* (buflen in JW's code not used)
+	int sysex_part_sent = FALSE;  /* the SysEx being read has had a part sent already */
 
 	/* Lets first fast forward to first status byte... */
 	if (!arguments.printonly) {
@@ -625,6 +641,7 @@ void* read_midi_from_serial_port(void* seq)
 					break;
 				}
 				buf[0] = buf[i];
+				sysex_part_sent = FALSE;
 				if(buf[0] != 0xF0)	//if not SysEx *new*
 					bytesleft = 3;
 				i = 1;
@@ -672,9 +689,16 @@ void* read_midi_from_serial_port(void* seq)
 			fflush(stdout);
 		}
 
+		/* Carry on a SysEx which did not fit in one buffer */
+		else if (buf[0] == 0xF0 && sysex_part_sent == TRUE) {
+			send_sysex_continuation(seq, port_out_id, buf + 1, i - 1);
+			sysex_part_sent = (buf[i - 1] != 0xF7);
+		}
+
 		/* parse MIDI message */
 		else {
 			parse_midi_command(seq, port_out_id, buf, i);  // *new* (was i+1 in EB's code)
+			sysex_part_sent = (buf[0] == 0xF0 && buf[i - 1] != 0xF7);
 		}
 	}
 }
