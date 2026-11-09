@@ -99,6 +99,7 @@
 #define MAX_DEV_STR_LEN    32
 #define MAX_MSG_SIZE     1024
 #define BUF_SIZE         1024  // Size of the serial midi buffer - determines the maximum size of sysex messages *new*
+#define SYSEX_OUT_SIZE  65536  // The longest sysex message passed from alsa to the serial port (a bulk dump fits)
 
 /* change this definition for the correct port */
 //#define _POSIX_SOURCE 1 /* POSIX compliant source */
@@ -230,6 +231,10 @@ int open_seq(snd_seq_t** seq)
 	snd_seq_set_client_name(*seq, arguments.name);
 
 	snd_midi_event_new(16, &midi_enc);
+	/* Always write the status byte: with running status the decoder leaves it out of a message
+	   on the same status as the one before, and the serial reader on the other end may have
+	   missed that one */
+	snd_midi_event_no_status(midi_enc, 1);
 
 	int deviceType = SND_SEQ_PORT_TYPE_APPLICATION;
 	if (arguments.hardwaredevice == TRUE) {
@@ -385,18 +390,24 @@ void parse_midi_command(snd_seq_t* seq, int port_out_id, unsigned char *buf, int
 void write_midi_action_to_serial_port(snd_seq_t* seq_handle)
 {
 	snd_seq_event_t* ev;
-	int errorAndByteCount = 0;
+	int errorCode = 0;
+	/* snd_seq_event_input returns how much is left in the input buffer (1 here), not the size
+	   of the event, so the number of bytes to write comes from the decoder instead */
+	long byteCount = 0;
 	unsigned char bytes[12] = {0x00, 0x00, 0xFF};  // *new*
-	unsigned char sysex_data[8192];  // *new*
+	static unsigned char sysex_data[SYSEX_OUT_SIZE];
 	int sysex_len = 0;  // *new*
 
 	do
 	{
-		errorAndByteCount = snd_seq_event_input(seq_handle, &ev);
+		errorCode = snd_seq_event_input(seq_handle, &ev);
+		/* Every event starts from nothing, so a message after a sysex is not written as the sysex again */
+		sysex_len = 0;
 
-		if (errorAndByteCount >= 0) {
+		if (errorCode >= 0) {
 
-			snd_midi_event_decode(midi_enc, bytes, sizeof(bytes), ev);
+			/* Negative for an event with no MIDI bytes, such as a port subscription */
+			byteCount = snd_midi_event_decode(midi_enc, bytes, sizeof(bytes), ev);
 			switch (ev->type)
 			{
 
@@ -502,53 +513,67 @@ void write_midi_action_to_serial_port(snd_seq_t* seq_handle)
 					break;
 
 				case SND_SEQ_EVENT_TICK:
+					/* MIDI Tick (F9) is left out on purpose: no 5-pin device uses it, and the sequencer
+					   sends one four times per clock, which would take a good part of the 31250 baud
+					   link away from everything else */
+					byteCount = 0;
 					if (!arguments.silent && arguments.verbose) {
-						printf("Alsa    %02X Tick message\n", bytes[0]&0xF0);
+						printf("Alsa    F9 Tick message, not passed on\n");
 						fflush(stdout);
 					}
 					break;
 
 				case SND_SEQ_EVENT_SYSEX:  // *new*
 					sysex_len = ev->data.ext.len;
-					if (!arguments.silent && arguments.verbose) printf("Alsa    F0 Sysex len = %04X   ", sysex_len);
-					int i;
-					for (i=0; i<sysex_len; i++) {
-						unsigned char* valPtr = (unsigned char*)ev->data.ext.ptr;  // *new*
-						unsigned char val = valPtr[i];  // *new*
-						if (!arguments.silent && arguments.verbose) printf("%02X ", val);  // *new* unsigned char cast suppressed
-						sysex_data[i] = val & 0xFF;  // *new* &0xFF (protection ?)
-					}
-					if (!arguments.silent && arguments.verbose) {
-						printf("\n");  // *new*
-						fflush(stdout);  // *new*
+					if (sysex_len > SYSEX_OUT_SIZE) {
+						if (!arguments.silent) {
+							printf("Alsa    F0 Sysex len = %04X is longer than the %d bytes we can pass on, dropped\n", sysex_len, SYSEX_OUT_SIZE);
+							fflush(stdout);
+						}
+						sysex_len = 0;
+					} else {
+						if (!arguments.silent && arguments.verbose) printf("Alsa    F0 Sysex len = %04X   ", sysex_len);
+						int i;
+						for (i=0; i<sysex_len; i++) {
+							unsigned char* valPtr = (unsigned char*)ev->data.ext.ptr;  // *new*
+							unsigned char val = valPtr[i];  // *new*
+							if (!arguments.silent && arguments.verbose) printf("%02X ", val);  // *new* unsigned char cast suppressed
+							sysex_data[i] = val & 0xFF;  // *new* &0xFF (protection ?)
+						}
+						if (!arguments.silent && arguments.verbose) {
+							printf("\n");  // *new*
+							fflush(stdout);  // *new*
+						}
 					}
 					break;
 
 				default:
-					if (!arguments.silent) {  // *new*
-						bytes[0] = ev->type;
-						printf("Alsa    %02X Unknown MIDI cmd   %02X %02X %02X\n", bytes[0]&0xF0, bytes[0]&0x0F, bytes[1], bytes[2]);  // *new*
-						fflush(stdout);  // *new*
+					/* The decoder has already written this event's bytes (active sensing, tune
+					   request, quarter frame, song select...), so only report it */
+					if (!arguments.silent && arguments.verbose) {
+						printf("Alsa    event type %d, %ld bytes\n", ev->type, byteCount);
+						fflush(stdout);
 					}
 					break;
 			}
+
+			// *new* sysex addition
+			if (sysex_len > 0) {
+				write(serial, sysex_data, sysex_len);
+				tcdrain(serial);  // *new* (speed up ?)
+			} else if (byteCount > 0) {
+				write(serial, bytes, byteCount);
+				tcdrain(serial);
+			}
+
+			snd_seq_free_event(ev);
 		} else {
+			/* Nothing was read, so there is nothing to write or to free */
 			if (!arguments.silent) {
-				printf("Error %i reading from ALSA: %s\n", errorAndByteCount, strerror(abs(errorAndByteCount)));
+				printf("Error %i reading from ALSA: %s\n", errorCode, strerror(abs(errorCode)));
 				fflush(stdout);
 			}
 		}
-
-		// *new* sysex addition
-		if (sysex_len > 0) {
-			write(serial, sysex_data, sysex_len);
-			tcdrain(serial);  // *new* (speed up ?)
-		} else {
-			write(serial, bytes, errorAndByteCount);
-			tcdrain(serial);
-		}
-
-		snd_seq_free_event(ev);
 
 	} while (snd_seq_event_input_pending(seq_handle, 0) > 0);
 }
