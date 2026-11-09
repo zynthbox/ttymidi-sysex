@@ -211,6 +211,7 @@ const char *argp_program_bug_address = "tvst@hotmail.com";
 static char doc[]       = "ttymidi - Connect serial port devices to ALSA MIDI programs!";
 static struct argp argp = { options, parse_opt, 0, doc };
 arguments_t arguments;
+snd_midi_event_t *midi_enc = 0;
 
 
 /* --------------------------------------------------------------------- */
@@ -227,6 +228,8 @@ int open_seq(snd_seq_t** seq)
 	}
 
 	snd_seq_set_client_name(*seq, arguments.name);
+
+	snd_midi_event_new(16, &midi_enc);
 
 	int deviceType = SND_SEQ_PORT_TYPE_APPLICATION;
 	if (arguments.hardwaredevice == TRUE) {
@@ -382,129 +385,167 @@ void parse_midi_command(snd_seq_t* seq, int port_out_id, unsigned char *buf, int
 void write_midi_action_to_serial_port(snd_seq_t* seq_handle)
 {
 	snd_seq_event_t* ev;
-	unsigned char bytes[] = {0x00, 0x00, 0xFF};  // *new*
-	unsigned char sysex_data[256];  // *new*
+	int errorAndByteCount = 0;
+	unsigned char bytes[12] = {0x00, 0x00, 0xFF};  // *new*
+	unsigned char sysex_data[8192];  // *new*
 	int sysex_len = 0;  // *new*
 
 	do
 	{
-		snd_seq_event_input(seq_handle, &ev);
+		errorAndByteCount = snd_seq_event_input(seq_handle, &ev);
 
-		switch (ev->type)
-		{
+		if (errorAndByteCount >= 0) {
 
-			case SND_SEQ_EVENT_NOTEOFF:
-				bytes[0] = 0x80 + ev->data.control.channel;
-				bytes[1] = ev->data.note.note;
-				bytes[2] = ev->data.note.velocity;
-				if (!arguments.silent && arguments.verbose) {
-					printf("Alsa    %02X Note off           %02X %02X %02X\n", bytes[0]&0xF0, bytes[0]&0xF, bytes[1], bytes[2]);
-					fflush(stdout);  // *new*
-				}
-				break;
+			snd_midi_event_decode(midi_enc, bytes, sizeof(bytes), ev);
+			switch (ev->type)
+			{
 
-			case SND_SEQ_EVENT_NOTEON:
-				bytes[0] = 0x90 + ev->data.control.channel;
-				bytes[1] = ev->data.note.note;
-				bytes[2] = ev->data.note.velocity;
-				if (!arguments.silent && arguments.verbose) {
-					printf("Alsa    %02X Note on            %02X %02X %02X\n", bytes[0]&0xF0, bytes[0]&0xF, bytes[1], bytes[2]);
-					fflush(stdout);  // *new*
-				}
-				break;
+				case SND_SEQ_EVENT_NOTEOFF:
+					bytes[0] = 0x80 + ev->data.control.channel;
+					bytes[1] = ev->data.note.note;
+					bytes[2] = ev->data.note.velocity;
+					if (!arguments.silent && arguments.verbose) {
+						printf("Alsa    %02X Note off           %02X %02X %02X\n", bytes[0]&0xF0, bytes[0]&0xF, bytes[1], bytes[2]);
+						fflush(stdout);  // *new*
+					}
+					break;
 
-			case SND_SEQ_EVENT_KEYPRESS:
-				bytes[0] = 0xA0 + ev->data.control.channel;  // *new* was 90 in original code
-				bytes[1] = ev->data.note.note;
-				bytes[2] = ev->data.note.velocity;
-				if (!arguments.silent && arguments.verbose) {
-					printf("Alsa    %02X Pressure change    %02X %02X %02X\n", bytes[0]&0xF0, bytes[0]&0xF, bytes[1], bytes[2]);
-					fflush(stdout);  // *new*
-				}
-				break;
+				case SND_SEQ_EVENT_NOTEON:
+					bytes[0] = 0x90 + ev->data.control.channel;
+					bytes[1] = ev->data.note.note;
+					bytes[2] = ev->data.note.velocity;
+					if (!arguments.silent && arguments.verbose) {
+						printf("Alsa    %02X Note on            %02X %02X %02X\n", bytes[0]&0xF0, bytes[0]&0xF, bytes[1], bytes[2]);
+						fflush(stdout);  // *new*
+					}
+					break;
 
-			case SND_SEQ_EVENT_CONTROLLER:
-				bytes[0] = 0xB0 + ev->data.control.channel;
-				bytes[1] = ev->data.control.param;
-				bytes[2] = ev->data.control.value;
-				if (!arguments.silent && arguments.verbose) {
-					printf("Alsa    %02X Controller change  %02X %02X %02X\n", bytes[0]&0xF0, bytes[0]&0xF, bytes[1], bytes[2]);
-					fflush(stdout);  // *new*
-				}
-				break;
+				case SND_SEQ_EVENT_KEYPRESS:
+					bytes[0] = 0xA0 + ev->data.control.channel;  // *new* was 90 in original code
+					bytes[1] = ev->data.note.note;
+					bytes[2] = ev->data.note.velocity;
+					if (!arguments.silent && arguments.verbose) {
+						printf("Alsa    %02X Pressure change    %02X %02X %02X\n", bytes[0]&0xF0, bytes[0]&0xF, bytes[1], bytes[2]);
+						fflush(stdout);  // *new*
+					}
+					break;
 
-			case SND_SEQ_EVENT_PGMCHANGE:
-				bytes[0] = 0xC0 + ev->data.control.channel;
-				bytes[1] = ev->data.control.value;
-				if (!arguments.silent && arguments.verbose) {
-					printf("Alsa    %02X Program change     %02X %02X %02X\n", bytes[0]&0xF0, bytes[0]&0xF, bytes[1], bytes[2]);
-					fflush(stdout);  // *new*
-				}
-				break;
+				case SND_SEQ_EVENT_CONTROLLER:
+					bytes[0] = 0xB0 + ev->data.control.channel;
+					bytes[1] = ev->data.control.param;
+					bytes[2] = ev->data.control.value;
+					if (!arguments.silent && arguments.verbose) {
+						printf("Alsa    %02X Controller change  %02X %02X %02X\n", bytes[0]&0xF0, bytes[0]&0xF, bytes[1], bytes[2]);
+						fflush(stdout);  // *new*
+					}
+					break;
 
-			case SND_SEQ_EVENT_CHANPRESS:
-				bytes[0] = 0xD0 + ev->data.control.channel;
-				bytes[1] = ev->data.control.value;
-				if (!arguments.silent && arguments.verbose) {
-					printf("Alsa    %02X Channel press      %02X %02X %02X\n", bytes[0]&0xF0, bytes[0]&0xF, bytes[1], bytes[2]);
-					fflush(stdout);  // *new*
-				}
-				break;
+				case SND_SEQ_EVENT_PGMCHANGE:
+					bytes[0] = 0xC0 + ev->data.control.channel;
+					bytes[1] = ev->data.control.value;
+					if (!arguments.silent && arguments.verbose) {
+						printf("Alsa    %02X Program change     %02X %02X %02X\n", bytes[0]&0xF0, bytes[0]&0xF, bytes[1], bytes[2]);
+						fflush(stdout);  // *new*
+					}
+					break;
 
-			case SND_SEQ_EVENT_PITCHBEND:
-				bytes[0] = 0xE0 + (unsigned char)ev->data.control.channel;  // *new*
-				ev->data.control.value += 8192;
-				bytes[1] = (unsigned char)(ev->data.control.value & 0x7F);  // *new*
-				bytes[2] = (unsigned char)(ev->data.control.value >> 7);  // *new*
-				if (!arguments.silent && arguments.verbose) {
-					printf("Alsa    %02X Pitch bend         %02X %04X\n", bytes[0]&0xF0, bytes[0]&0xF, ev->data.control.value);
-					fflush(stdout);  // *new*
-				}
-				break;
+				case SND_SEQ_EVENT_CHANPRESS:
+					bytes[0] = 0xD0 + ev->data.control.channel;
+					bytes[1] = ev->data.control.value;
+					if (!arguments.silent && arguments.verbose) {
+						printf("Alsa    %02X Channel press      %02X %02X %02X\n", bytes[0]&0xF0, bytes[0]&0xF, bytes[1], bytes[2]);
+						fflush(stdout);  // *new*
+					}
+					break;
 
-			case SND_SEQ_EVENT_SYSEX:  // *new*
-				sysex_len = ev->data.ext.len;
-				if (!arguments.silent && arguments.verbose) printf("Alsa    F0 Sysex len = %04X   ", sysex_len);
-				int i;
-				for (i=0; i<sysex_len; i++) {
-					unsigned char* valPtr = (unsigned char*)ev->data.ext.ptr;  // *new*
-					unsigned char val = valPtr[i];  // *new*
-					if (!arguments.silent && arguments.verbose) printf("%02X ", val);  // *new* unsigned char cast suppressed
-					sysex_data[i] = val & 0xFF;  // *new* &0xFF (protection ?)
-				}
-				if (!arguments.silent && arguments.verbose) {
-					printf("\n");  // *new*
-					fflush(stdout);  // *new*
-				}
-				break;
+				case SND_SEQ_EVENT_PITCHBEND:
+					bytes[0] = 0xE0 + (unsigned char)ev->data.control.channel;  // *new*
+					ev->data.control.value += 8192;
+					bytes[1] = (unsigned char)(ev->data.control.value & 0x7F);  // *new*
+					bytes[2] = (unsigned char)(ev->data.control.value >> 7);  // *new*
+					if (!arguments.silent && arguments.verbose) {
+						printf("Alsa    %02X Pitch bend         %02X %04X\n", bytes[0]&0xF0, bytes[0]&0xF, ev->data.control.value);
+						fflush(stdout);  // *new*
+					}
+					break;
 
-			default:
-				if (!arguments.silent) {  // *new*
-					printf("Alsa    %02X Unknown MIDI cmd   %02X %02X %02X\n", bytes[0]&0xF0, bytes[0]&0x0F, bytes[1], bytes[2]);  // *new*
-					fflush(stdout);  // *new*
-				}
-				break;
+				case SND_SEQ_EVENT_SONGPOS:
+					if (!arguments.silent && arguments.verbose) {
+						printf("Alsa    %02X Song Position Pointer: %02X %02X\n", bytes[0]&0xF0, bytes[1], bytes[2]);
+						fflush(stdout);
+					}
+					break;
+
+				case SND_SEQ_EVENT_START:
+					if (!arguments.silent && arguments.verbose) {
+						printf("Alsa    %02X Start message\n", bytes[0]&0xF0);
+						fflush(stdout);
+					}
+					break;
+				case SND_SEQ_EVENT_CONTINUE:
+					if (!arguments.silent && arguments.verbose) {
+						printf("Alsa    %02X Continue message\n", bytes[0]&0xF0);
+						fflush(stdout);
+					}
+					break;
+				case SND_SEQ_EVENT_STOP:
+					if (!arguments.silent && arguments.verbose) {
+						printf("Alsa    %02X Stop message\n", bytes[0]&0xF0);
+						fflush(stdout);
+					}
+					break;
+				case SND_SEQ_EVENT_CLOCK:
+					if (!arguments.silent && arguments.verbose) {
+						printf("Alsa    %02X Clock message\n", bytes[0]&0xF0);
+						fflush(stdout);
+					}
+					break;
+
+				case SND_SEQ_EVENT_TICK:
+					if (!arguments.silent && arguments.verbose) {
+						printf("Alsa    %02X Tick message\n", bytes[0]&0xF0);
+						fflush(stdout);
+					}
+					break;
+
+				case SND_SEQ_EVENT_SYSEX:  // *new*
+					sysex_len = ev->data.ext.len;
+					if (!arguments.silent && arguments.verbose) printf("Alsa    F0 Sysex len = %04X   ", sysex_len);
+					int i;
+					for (i=0; i<sysex_len; i++) {
+						unsigned char* valPtr = (unsigned char*)ev->data.ext.ptr;  // *new*
+						unsigned char val = valPtr[i];  // *new*
+						if (!arguments.silent && arguments.verbose) printf("%02X ", val);  // *new* unsigned char cast suppressed
+						sysex_data[i] = val & 0xFF;  // *new* &0xFF (protection ?)
+					}
+					if (!arguments.silent && arguments.verbose) {
+						printf("\n");  // *new*
+						fflush(stdout);  // *new*
+					}
+					break;
+
+				default:
+					if (!arguments.silent) {  // *new*
+						bytes[0] = ev->type;
+						printf("Alsa    %02X Unknown MIDI cmd   %02X %02X %02X\n", bytes[0]&0xF0, bytes[0]&0x0F, bytes[1], bytes[2]);  // *new*
+						fflush(stdout);  // *new*
+					}
+					break;
+			}
+		} else {
+			if (!arguments.silent) {
+				printf("Error %i reading from ALSA: %s\n", errorAndByteCount, strerror(abs(errorAndByteCount)));
+				fflush(stdout);
+			}
 		}
-/*
-		bytes[0] = bytes[0] & 0xFF;  // *new* &0xFF (protection ?)
-		bytes[1] = bytes[1] & 0xFF;  // *new* &0xFF (protection ?)
-		bytes[2] = bytes[2] & 0xFF;  // *new* &0xFF (protection ?)
-*/
+
 		// *new* sysex addition
 		if (sysex_len > 0) {
 			write(serial, sysex_data, sysex_len);
 			tcdrain(serial);  // *new* (speed up ?)
 		} else {
-			if (bytes[0]!=0x00)
-			{
-				bytes[1] = (bytes[1] & 0x7F); // just to be sure that one bit is really zero
-				if (bytes[2]==0xFF) {
-					write(serial, bytes, 2);
-				} else {
-					bytes[2] = (bytes[2] & 0x7F);
-					write(serial, bytes, 3);
-				}
-			}
+			write(serial, bytes, errorAndByteCount);
+			tcdrain(serial);
 		}
 
 		snd_seq_free_event(ev);
